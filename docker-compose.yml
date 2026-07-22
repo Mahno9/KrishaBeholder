@@ -1,0 +1,11 @@
+services:
+  krishabeholder:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      STATE_PATH: /data/state.json
+      SEARCHES_PATH: /data/searches.json
+    volumes:
+      - ./data:/data
+      - ./searches.json:/data/searches.json
