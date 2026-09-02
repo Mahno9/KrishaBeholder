@@ -20,6 +20,10 @@ class State:
         self.last_success: str | None = data.get("last_success")
         self.paused: set[int] = set(data.get("paused", []))
         self.update_offset: int = data.get("update_offset", 0)
+        self.failures: int = data.get("failures", 0)
+        self.degraded_notified: bool = data.get("degraded_notified", False)
+        self.blocked_streak: int = data.get("blocked_streak", 0)
+        self.blocked_notified: bool = data.get("blocked_notified", False)
 
     @classmethod
     def load(cls, path: Path, store: GistStore | None = None) -> "State":
@@ -53,6 +57,10 @@ class State:
             "last_success": self.last_success,
             "paused": sorted(self.paused),
             "update_offset": self.update_offset,
+            "failures": self.failures,
+            "degraded_notified": self.degraded_notified,
+            "blocked_streak": self.blocked_streak,
+            "blocked_notified": self.blocked_notified,
         }
         text = json.dumps(payload, ensure_ascii=False, indent=1)
         self.path.parent.mkdir(parents=True, exist_ok=True)

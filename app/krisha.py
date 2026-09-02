@@ -23,6 +23,13 @@ class ParseError(Exception):
     pass
 
 
+class BlockedError(ParseError):
+    """krisha.kz, похоже, блокирует наши запросы (капча/анти-бот/лимит) — не ошибка вёрстки."""
+
+
+BLOCK_RETRY_DELAYS_S = (20, 60)  # паузы перед повторными попытками при признаках блокировки
+
+
 @dataclass(frozen=True)
 class Listing:
     id: str
@@ -52,6 +59,8 @@ def build_list_url(list_path: str, filters: tuple[tuple[str, str], ...],
 
 def fetch_page(session: requests.Session, url: str) -> str:
     response = session.get(url, timeout=15)
+    if response.status_code in (403, 429):
+        raise BlockedError(f"HTTP {response.status_code} на {url} — похоже на блокировку/анти-бот")
     response.raise_for_status()
     return response.text
 
@@ -92,13 +101,20 @@ def parse_listings(html: str) -> list[Listing]:
 def fetch_all(session: requests.Session, list_path: str,
               filters: tuple[tuple[str, str], ...], bounds: str,
               max_pages: int, page_delay_s: float) -> list[Listing]:
-    """Обходит все страницы поиска; бросает ParseError при подозрении на смену вёрстки."""
+    """Обходит все страницы поиска.
+
+    Бросает BlockedError при признаках анти-бота (капча/лимит — нет карточек и
+    не нашёлся nbTotal), ParseError — при подозрении на смену вёрстки.
+    """
     url = build_list_url(list_path, filters, bounds, page=1)
     html = fetch_page(session, url)
     total = parse_total(html)
     listings = parse_listings(html)
-    if not listings and (total or 0) > 0:
-        raise ParseError(f"nbTotal={total}, но карточки не распарсились: {url}")
+    if not listings:
+        if total is None:
+            raise BlockedError(f"нет карточек и не нашёлся nbTotal — похоже на блокировку/капчу: {url}")
+        if total > 0:
+            raise ParseError(f"nbTotal={total}, но карточки не распарсились: {url}")
 
     pages = min(math.ceil((total or 0) / PER_PAGE), max_pages) if total else 1
     if total and total > max_pages * PER_PAGE:
@@ -117,3 +133,21 @@ def fetch_all(session: requests.Session, list_path: str,
     log.info("Обход %s: nbTotal=%s, страниц=%d, уникальных карточек=%d",
              list_path, total, pages, len(listings))
     return listings
+
+
+def fetch_all_with_retry(session: requests.Session, list_path: str,
+                         filters: tuple[tuple[str, str], ...], bounds: str,
+                         max_pages: int, page_delay_s: float) -> list[Listing]:
+    """Как fetch_all, но при признаках блокировки ждёт и пробует снова, прежде чем сдаться.
+
+    Так разовый анти-бот/капча-ответ не срывает доставку — данные просто приходят
+    с небольшой задержкой вместо ошибки.
+    """
+    for attempt, delay in enumerate(BLOCK_RETRY_DELAYS_S):
+        try:
+            return fetch_all(session, list_path, filters, bounds, max_pages, page_delay_s)
+        except BlockedError:
+            log.warning("Похоже на блокировку krisha.kz — жду %d с и пробую снова (%d/%d)",
+                        delay, attempt + 1, len(BLOCK_RETRY_DELAYS_S))
+            time.sleep(delay)
+    return fetch_all(session, list_path, filters, bounds, max_pages, page_delay_s)

@@ -17,6 +17,39 @@ log = logging.getLogger("beholder")
 
 FLOOD_LIMIT = 25          # больше новых за цикл — одно сводное сообщение вместо спама
 DEGRADED_AFTER = 5        # подряд неудачных циклов до сообщения о деградации
+BLOCKED_AFTER = 3         # подряд циклов с признаками блокировки krisha.kz до алерта
+
+
+def _alert_targets(cfg: config.Config, state: State, searches: list[config.Search]) -> set[int]:
+    targets = {s.chat_id for s in searches if s.enabled} - state.paused
+    if cfg.admin_chat_id is not None:
+        targets.add(cfg.admin_chat_id)
+    return targets
+
+
+def _track_blocking(cfg: config.Config, state: State, bot: TelegramBot | None,
+                     searches: list[config.Search], blocked: int) -> None:
+    """Копит подряд-циклы с блокировкой и один раз шлёт алерт после BLOCKED_AFTER."""
+    if blocked > 0:
+        state.blocked_streak += 1
+    else:
+        if state.blocked_streak:
+            log.info("krisha.kz снова отвечает нормально (блокировка длилась %d цикл(ов))",
+                      state.blocked_streak)
+        state.blocked_streak = 0
+        state.blocked_notified = False
+
+    if (state.blocked_streak >= BLOCKED_AFTER and not state.blocked_notified
+            and bot is not None and not cfg.dry_run):
+        text = (f"⚠️ krisha.kz, похоже, блокирует наши запросы (антиспам/лимит) уже "
+                f"{state.blocked_streak} циклов подряд. Как только блокировка снимется, "
+                "рассылка продолжится сама — делать ничего не нужно.")
+        for target in _alert_targets(cfg, state, searches):
+            try:
+                bot.send_text(target, text)
+            except Exception:
+                log.exception("Не удалось отправить сообщение о блокировке в chat_id=%s", target)
+        state.blocked_notified = True
 
 
 def _group_fresh(pairs: list[tuple[config.Search, list[krisha.Listing]]]
@@ -65,14 +98,20 @@ def _dispatch_group(cfg: config.Config, state: State, bot: TelegramBot | None,
 def run_cycle(cfg: config.Config, state: State, bot: TelegramBot | None,
               session: requests.Session, searches: list[config.Search]) -> None:
     pairs: list[tuple[config.Search, list[krisha.Listing]]] = []
+    blocked = 0
 
     for search in searches:
         if not search.enabled:
             continue
         bounds = geo.bounds_param(search.lat, search.lon, search.zoom, *cfg.viewport_px)
         try:
-            listings = krisha.fetch_all(session, search.list_path, search.filters,
-                                        bounds, cfg.max_pages, cfg.page_delay_s)
+            listings = krisha.fetch_all_with_retry(session, search.list_path, search.filters,
+                                                    bounds, cfg.max_pages, cfg.page_delay_s)
+        except krisha.BlockedError:
+            blocked += 1
+            log.warning("Поиск '%s': похоже на блокировку krisha.kz даже после повторов — "
+                        "прекращаю запросы до следующего цикла", search.name)
+            break
         except Exception:
             log.exception("Поиск '%s' не удался, пропускаю до следующего цикла", search.name)
             continue
@@ -87,6 +126,8 @@ def run_cycle(cfg: config.Config, state: State, bot: TelegramBot | None,
         elif fresh:
             pairs.append((search, fresh))
         time.sleep(cfg.page_delay_s)
+
+    _track_blocking(cfg, state, bot, searches, blocked)
 
     new_by_chat = _group_fresh(pairs)
     if not new_by_chat:
@@ -150,8 +191,6 @@ def main() -> int:
         log.error("TELEGRAM_BOT_TOKEN не задан — выхожу")
         return 1
 
-    failures = 0
-    degraded_notified = False
     while True:
         searches = config.load_searches(cfg.searches_path, fallback=searches, inline_json=cfg.searches_json)
         if bot is not None and not cfg.dry_run:
@@ -161,22 +200,22 @@ def main() -> int:
                 log.exception("Опрос команд завершился с ошибкой")
         try:
             run_cycle(cfg, state, bot, session, searches)
-            failures = 0
-            degraded_notified = False
+            if state.failures or state.degraded_notified:
+                state.failures = 0
+                state.degraded_notified = False
+                state.save()
         except Exception:
-            failures += 1
-            log.exception("Цикл завершился с ошибкой (%d подряд)", failures)
-            if failures >= DEGRADED_AFTER and not degraded_notified and bot:
-                targets = {s.chat_id for s in searches if s.enabled} - state.paused
-                if cfg.admin_chat_id is not None:
-                    targets.add(cfg.admin_chat_id)
-                for target in targets:
+            state.failures += 1
+            log.exception("Цикл завершился с ошибкой (%d подряд)", state.failures)
+            if state.failures >= DEGRADED_AFTER and not state.degraded_notified and bot:
+                for target in _alert_targets(cfg, state, searches):
                     try:
                         bot.send_text(target,
-                                      f"⚠️ Сервис не может обновить данные уже {failures} циклов подряд.")
+                                      f"⚠️ Сервис не может обновить данные уже {state.failures} циклов подряд.")
                     except Exception:
                         log.exception("Не удалось отправить сообщение о деградации в chat_id=%s", target)
-                degraded_notified = True
+                state.degraded_notified = True
+            state.save()
         if cfg.run_once:
             return 0
         delay = cfg.poll_interval_s + random.uniform(0, 120)
