@@ -3,7 +3,8 @@
     {
       "name": "Центр",
       "url": "https://krisha.kz/map/arenda/kvartiry/?das[_sys.hasphoto]=1&das[live.rooms][0]=1&das[live.rooms][1]=2&das[live.square][from]=35&das[price][to]=230000&zoom=14&lat=43.24776&lon=76.93696",
-      "enabled": true
+      "enabled": true,
+      "chat_id": "TODO_REPLACE_WITH_REAL_CHAT_ID"
     }
   ]
 }

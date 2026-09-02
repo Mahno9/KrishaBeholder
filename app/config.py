@@ -15,6 +15,7 @@ class Search:
     name: str
     url: str
     enabled: bool
+    chat_id: int                        # получатель уведомлений этого поиска
     list_path: str                      # /arenda/kvartiry/ — путь карты без /map
     filters: tuple[tuple[str, str], ...]  # das[...] и прочие параметры как есть
     lat: float
@@ -25,8 +26,7 @@ class Search:
 @dataclass
 class Config:
     bot_token: str
-    chat_id: int | None
-    tg_username: str
+    admin_chat_id: int | None
     poll_interval_s: int
     max_pages: int
     page_delay_s: float
@@ -53,11 +53,10 @@ def _env(name: str, default: str) -> str:
 def load_config(argv: list[str] | None = None) -> Config:
     argv = argv or []
     w, _, h = _env("VIEWPORT_PX", "1000x800").partition("x")
-    chat_id_raw = _env("TELEGRAM_CHAT_ID", "")
+    admin_chat_id_raw = _env("ADMIN_CHAT_ID", "")
     return Config(
         bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
-        chat_id=int(chat_id_raw) if chat_id_raw else None,
-        tg_username=_env("TARGET_TG_USERNAME", "black_mug").lstrip("@").lower(),
+        admin_chat_id=int(admin_chat_id_raw) if admin_chat_id_raw else None,
         poll_interval_s=int(_env("POLL_INTERVAL_S", "1800")),
         max_pages=int(_env("MAX_PAGES", "10")),
         page_delay_s=float(_env("PAGE_DELAY_S", "2.5")),
@@ -72,7 +71,7 @@ def load_config(argv: list[str] | None = None) -> Config:
     )
 
 
-def parse_map_url(name: str, url: str, enabled: bool) -> Search:
+def parse_map_url(name: str, url: str, enabled: bool, chat_id: int) -> Search:
     parts = urlsplit(url)
     if not parts.path.startswith("/map/"):
         raise ValueError(f"поиск '{name}': ожидается ссылка на карту (/map/...), получено {parts.path}")
@@ -94,7 +93,7 @@ def parse_map_url(name: str, url: str, enabled: bool) -> Search:
             filters.append((key, value))
     if lat is None or lon is None:
         raise ValueError(f"поиск '{name}': в ссылке нет lat/lon")
-    return Search(name=name, url=url, enabled=enabled, list_path=list_path,
+    return Search(name=name, url=url, enabled=enabled, chat_id=chat_id, list_path=list_path,
                   filters=tuple(filters), lat=lat, lon=lon, zoom=zoom)
 
 
@@ -109,7 +108,8 @@ def load_searches(path: Path, fallback: list[Search]) -> list[Search]:
             if name in names:
                 raise ValueError(f"дублирующееся имя поиска '{name}'")
             names.add(name)
-            searches.append(parse_map_url(name, item["url"], item.get("enabled", True)))
+            chat_id = int(item["chat_id"])
+            searches.append(parse_map_url(name, item["url"], item.get("enabled", True), chat_id))
         if not searches:
             raise ValueError("список searches пуст")
         return searches

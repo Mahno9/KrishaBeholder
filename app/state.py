@@ -15,10 +15,11 @@ class State:
     def __init__(self, path: Path, data: dict, store: GistStore | None = None):
         self.path = path
         self.store = store
-        self.chat_id: int | None = data.get("chat_id")
         self.baselines: dict[str, bool] = data.get("baselines", {})
         self.seen: dict[str, dict] = data.get("seen", {})
         self.last_success: str | None = data.get("last_success")
+        self.paused: set[int] = set(data.get("paused", []))
+        self.update_offset: int = data.get("update_offset", 0)
 
     @classmethod
     def load(cls, path: Path, store: GistStore | None = None) -> "State":
@@ -47,10 +48,11 @@ class State:
 
     def save(self) -> None:
         payload = {
-            "chat_id": self.chat_id,
             "baselines": self.baselines,
             "seen": self.seen,
             "last_success": self.last_success,
+            "paused": sorted(self.paused),
+            "update_offset": self.update_offset,
         }
         text = json.dumps(payload, ensure_ascii=False, indent=1)
         self.path.parent.mkdir(parents=True, exist_ok=True)

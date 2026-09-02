@@ -19,9 +19,52 @@ FLOOD_LIMIT = 25          # больше новых за цикл — одно �
 DEGRADED_AFTER = 5        # подряд неудачных циклов до сообщения о деградации
 
 
+def _group_fresh(pairs: list[tuple[config.Search, list[krisha.Listing]]]
+                  ) -> dict[int, dict[str, tuple[krisha.Listing, str]]]:
+    """Группирует свежие объявления по chat_id получателя; дедуп по ad_id — только внутри одного chat_id."""
+    by_chat: dict[int, dict[str, tuple[krisha.Listing, str]]] = {}
+    for search, fresh in pairs:
+        group = by_chat.setdefault(search.chat_id, {})
+        for listing in fresh:
+            group.setdefault(listing.id, (listing, search.name))
+    return by_chat
+
+
+def _dispatch_group(cfg: config.Config, state: State, bot: TelegramBot | None,
+                     chat_id: int, group: dict[str, tuple[krisha.Listing, str]]) -> None:
+    if cfg.dry_run or bot is None:
+        for listing, search_name in group.values():
+            log.info("[dry-run] Новое: %s | %s | %s | %s", listing.title, listing.price,
+                     search_name, listing.url)
+            state.mark_seen(listing.id, search_name, notified=False)
+        state.save()
+        return
+    if chat_id in state.paused:
+        for listing, search_name in group.values():
+            state.mark_seen(listing.id, search_name, notified=False)
+        state.save()
+        log.info("chat_id=%s на паузе — %d новых помечены без уведомления", chat_id, len(group))
+        return
+    if len(group) > FLOOD_LIMIT:
+        log.warning("chat_id=%s: сразу %d новых — похоже на аномалию, шлю сводку", chat_id, len(group))
+        bot.send_text(chat_id,
+                      f"⚠️ За цикл появилось сразу {len(group)} новых объявлений — "
+                      "возможен сбой парсинга или изменение области. Проверьте поиск на сайте.")
+        for listing, search_name in group.values():
+            state.mark_seen(listing.id, search_name, notified=False)
+        state.save()
+        return
+    for listing, search_name in group.values():
+        bot.send_listing(chat_id, listing, search_name)
+        state.mark_seen(listing.id, search_name, notified=True)
+        state.save()
+        log.info("Отправлено: %s (%s) -> chat_id=%s", listing.url, search_name, chat_id)
+        time.sleep(1)
+
+
 def run_cycle(cfg: config.Config, state: State, bot: TelegramBot | None,
               session: requests.Session, searches: list[config.Search]) -> None:
-    new_by_id: dict[str, tuple[krisha.Listing, str]] = {}
+    pairs: list[tuple[config.Search, list[krisha.Listing]]] = []
 
     for search in searches:
         if not search.enabled:
@@ -41,36 +84,46 @@ def run_cycle(cfg: config.Config, state: State, bot: TelegramBot | None,
             state.baselines[search.name] = True
             state.save()
             log.info("Тихая база поиска '%s': запомнено %d объявлений", search.name, len(fresh))
-        else:
-            for listing in fresh:
-                new_by_id.setdefault(listing.id, (listing, search.name))
+        elif fresh:
+            pairs.append((search, fresh))
         time.sleep(cfg.page_delay_s)
 
-    if not new_by_id:
+    new_by_chat = _group_fresh(pairs)
+    if not new_by_chat:
         log.info("Новых объявлений нет")
-    elif cfg.dry_run or bot is None or state.chat_id is None:
-        for listing, search_name in new_by_id.values():
-            log.info("[dry-run] Новое: %s | %s | %s | %s", listing.title, listing.price,
-                     search_name, listing.url)
-            state.mark_seen(listing.id, search_name, notified=False)
-        state.save()
-    elif len(new_by_id) > FLOOD_LIMIT:
-        log.warning("Найдено сразу %d новых — похоже на аномалию, шлю сводку", len(new_by_id))
-        bot.send_text(state.chat_id,
-                      f"⚠️ За цикл появилось сразу {len(new_by_id)} новых объявлений — "
-                      "возможен сбой парсинга или изменение области. Проверьте поиск на сайте.")
-        for listing, search_name in new_by_id.values():
-            state.mark_seen(listing.id, search_name, notified=False)
-        state.save()
     else:
-        for listing, search_name in new_by_id.values():
-            bot.send_listing(state.chat_id, listing, search_name)
-            state.mark_seen(listing.id, search_name, notified=True)
-            state.save()
-            log.info("Отправлено: %s (%s)", listing.url, search_name)
-            time.sleep(1)
+        for chat_id, group in new_by_chat.items():
+            _dispatch_group(cfg, state, bot, chat_id, group)
 
     state.last_success = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    state.save()
+
+
+def poll_commands(bot: TelegramBot, state: State) -> None:
+    """Короткий (не блокирующий) опрос /start и /stop; прочие апдейты пропускаются."""
+    try:
+        bot.api("deleteWebhook")
+        updates = bot.get_updates(state.update_offset)
+    except Exception:
+        log.exception("Не удалось опросить команды — пропускаю до следующего цикла")
+        return
+    for update in updates:
+        state.update_offset = update["update_id"] + 1
+        message = update.get("message") or {}
+        chat_id = (message.get("chat") or {}).get("id")
+        text = (message.get("text") or "").strip().lower()
+        if chat_id is None:
+            continue
+        try:
+            if text == "/start":
+                state.paused.discard(chat_id)
+                bot.send_text(chat_id, f"Готово. Ваш chat_id: {chat_id}\n"
+                                        "Если рассылка была на паузе — она возобновлена.")
+            elif text == "/stop":
+                state.paused.add(chat_id)
+                bot.send_text(chat_id, "Рассылка приостановлена. Пришлите /start, чтобы возобновить.")
+        except Exception:
+            log.exception("Не удалось обработать команду от chat_id=%s", chat_id)
     state.save()
 
 
@@ -87,22 +140,12 @@ def main() -> int:
 
     searches = config.load_searches(cfg.searches_path, fallback=[])
     if not searches:
-        log.error("Нет валидных поисков в %s — выхожу", cfg.searches_path)
-        return 1
+        log.warning("Нет валидных поисков в %s — жду, пока их добавят "
+                    "(команды /start и /stop продолжают работать)", cfg.searches_path)
 
     bot: TelegramBot | None = None
     if cfg.bot_token:
         bot = TelegramBot(cfg.bot_token)
-        if cfg.chat_id:
-            state.chat_id = cfg.chat_id
-        if state.chat_id is None and not cfg.dry_run:
-            chat_id = bot.discover_chat_id(cfg.tg_username, once=cfg.run_once)
-            if chat_id is None:
-                log.warning("chat_id ещё не определён. Отправьте боту /start с аккаунта @%s — "
-                            "следующий запуск его подхватит.", cfg.tg_username)
-                return 0
-            state.chat_id = chat_id
-            state.save()
     elif not cfg.dry_run:
         log.error("TELEGRAM_BOT_TOKEN не задан — выхожу")
         return 1
@@ -111,6 +154,11 @@ def main() -> int:
     degraded_notified = False
     while True:
         searches = config.load_searches(cfg.searches_path, fallback=searches)
+        if bot is not None and not cfg.dry_run:
+            try:
+                poll_commands(bot, state)
+            except Exception:
+                log.exception("Опрос команд завершился с ошибкой")
         try:
             run_cycle(cfg, state, bot, session, searches)
             failures = 0
@@ -118,14 +166,17 @@ def main() -> int:
         except Exception:
             failures += 1
             log.exception("Цикл завершился с ошибкой (%d подряд)", failures)
-            if (failures >= DEGRADED_AFTER and not degraded_notified
-                    and bot and state.chat_id):
-                try:
-                    bot.send_text(state.chat_id,
-                                  f"⚠️ Сервис не может обновить данные уже {failures} циклов подряд.")
-                    degraded_notified = True
-                except Exception:
-                    log.exception("Не удалось отправить сообщение о деградации")
+            if failures >= DEGRADED_AFTER and not degraded_notified and bot:
+                targets = {s.chat_id for s in searches if s.enabled} - state.paused
+                if cfg.admin_chat_id is not None:
+                    targets.add(cfg.admin_chat_id)
+                for target in targets:
+                    try:
+                        bot.send_text(target,
+                                      f"⚠️ Сервис не может обновить данные уже {failures} циклов подряд.")
+                    except Exception:
+                        log.exception("Не удалось отправить сообщение о деградации в chat_id=%s", target)
+                degraded_notified = True
         if cfg.run_once:
             return 0
         delay = cfg.poll_interval_s + random.uniform(0, 120)
