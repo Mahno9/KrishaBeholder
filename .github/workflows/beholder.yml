@@ -5,7 +5,7 @@ on:
     # Каждые 30 минут, но НЕ в :00/:30 — это самые загруженные слоты GitHub,
     # где scheduled-запуски чаще всего задерживаются и дропаются.
     - cron: "7,37 * * * *"
-  workflow_dispatch: {}       # ручной запуск: первичное определение chat_id и проверка
+  workflow_dispatch: {}       # ручной запуск для проверки
 
 # Не допускаем одновременных прогонов: иначе конфликт getUpdates (409)
 # и гонка записи в gist.
@@ -30,7 +30,7 @@ jobs:
       - name: Один цикл проверки
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TARGET_TG_USERNAME: ${{ vars.TARGET_TG_USERNAME }}
+          ADMIN_CHAT_ID: ${{ vars.ADMIN_CHAT_ID }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           SEARCHES_PATH: searches.json
