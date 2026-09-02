@@ -32,6 +32,7 @@ class Config:
     page_delay_s: float
     state_path: Path
     searches_path: Path
+    searches_json: str
     viewport_px: tuple[int, int]
     run_once: bool
     dry_run: bool
@@ -62,6 +63,7 @@ def load_config(argv: list[str] | None = None) -> Config:
         page_delay_s=float(_env("PAGE_DELAY_S", "2.5")),
         state_path=Path(_env("STATE_PATH", "/data/state.json")),
         searches_path=Path(_env("SEARCHES_PATH", "/data/searches.json")),
+        searches_json=os.environ.get("SEARCHES_JSON", "").strip(),
         viewport_px=(int(w), int(h)),
         run_once=os.environ.get("RUN_ONCE", "") == "1" or "--once" in argv,
         dry_run=os.environ.get("DRY_RUN", "") == "1" or "--dry-run" in argv,
@@ -97,10 +99,18 @@ def parse_map_url(name: str, url: str, enabled: bool, chat_id: int) -> Search:
                   filters=tuple(filters), lat=lat, lon=lon, zoom=zoom)
 
 
-def load_searches(path: Path, fallback: list[Search]) -> list[Search]:
-    """Читает searches.json; при ошибке возвращает последнюю валидную версию."""
+def load_searches(path: Path, fallback: list[Search], inline_json: str = "") -> list[Search]:
+    """Читает searches: из inline_json (переменная SEARCHES_JSON), если задана, иначе из файла path.
+
+    SEARCHES_JSON позволяет менять получателей и поиски прямо в GitHub Actions
+    (Settings → Secrets and variables → Actions → Variables) без коммита —
+    формат тот же {"searches": [...]}, что и в searches.json.
+    При ошибке (в т.ч. невалидный JSON) — предыдущая валидная версия.
+    """
+    source = "SEARCHES_JSON" if inline_json else str(path)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw_text = inline_json if inline_json else path.read_text(encoding="utf-8")
+        raw = json.loads(raw_text)
         searches = []
         names = set()
         for item in raw["searches"]:
@@ -115,5 +125,5 @@ def load_searches(path: Path, fallback: list[Search]) -> list[Search]:
         return searches
     except Exception:
         log.exception("Не удалось прочитать %s — использую предыдущую версию (%d поисков)",
-                      path, len(fallback))
+                      source, len(fallback))
         return fallback

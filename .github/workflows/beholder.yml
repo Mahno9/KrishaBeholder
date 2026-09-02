@@ -33,6 +33,7 @@ jobs:
           ADMIN_CHAT_ID: ${{ vars.ADMIN_CHAT_ID }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          SEARCHES_JSON: ${{ vars.SEARCHES_JSON }}
           SEARCHES_PATH: searches.json
           STATE_PATH: data/state.json
           POLL_INTERVAL_S: ${{ vars.POLL_INTERVAL_S }}

@@ -138,9 +138,9 @@ def main() -> int:
     state = State.load(cfg.state_path, store)
     session = krisha.make_session()
 
-    searches = config.load_searches(cfg.searches_path, fallback=[])
+    searches = config.load_searches(cfg.searches_path, fallback=[], inline_json=cfg.searches_json)
     if not searches:
-        log.warning("Нет валидных поисков в %s — жду, пока их добавят "
+        log.warning("Нет валидных поисков (SEARCHES_JSON / %s) — жду, пока их добавят "
                     "(команды /start и /stop продолжают работать)", cfg.searches_path)
 
     bot: TelegramBot | None = None
@@ -153,7 +153,7 @@ def main() -> int:
     failures = 0
     degraded_notified = False
     while True:
-        searches = config.load_searches(cfg.searches_path, fallback=searches)
+        searches = config.load_searches(cfg.searches_path, fallback=searches, inline_json=cfg.searches_json)
         if bot is not None and not cfg.dry_run:
             try:
                 poll_commands(bot, state)
