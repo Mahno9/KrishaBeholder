@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import requests
 
-from . import config, geo, krisha
+from . import config, geo, krisha, subscriptions
 from .state import State
 from .store import GistStore
 from .telegram import TelegramBot
@@ -50,6 +50,12 @@ def _track_blocking(cfg: config.Config, state: State, bot: TelegramBot | None,
             except Exception:
                 log.exception("Не удалось отправить сообщение о блокировке в chat_id=%s", target)
         state.blocked_notified = True
+
+
+def _baseline_key(search: config.Search) -> str:
+    """chat_id+имя, а не голое имя: у разных пользователей могут совпадать имена
+    (боты-подписки нумеруют «Поиск 1».."Поиск 3» в рамках одного chat_id)."""
+    return f"{search.chat_id}:{search.name}"
 
 
 def _group_fresh(pairs: list[tuple[config.Search, list[krisha.Listing]]]
@@ -117,12 +123,14 @@ def run_cycle(cfg: config.Config, state: State, bot: TelegramBot | None,
             continue
 
         fresh = [listing for listing in listings if listing.id not in state.seen]
-        if not state.baselines.get(search.name):
+        baseline_key = _baseline_key(search)
+        if not state.baselines.get(baseline_key):
             for listing in fresh:
                 state.mark_seen(listing.id, search.name, notified=False)
-            state.baselines[search.name] = True
+            state.baselines[baseline_key] = True
             state.save()
-            log.info("Тихая база поиска '%s': запомнено %d объявлений", search.name, len(fresh))
+            log.info("Тихая база поиска '%s' (chat_id=%s): запомнено %d объявлений",
+                      search.name, search.chat_id, len(fresh))
         elif fresh:
             pairs.append((search, fresh))
         time.sleep(cfg.page_delay_s)
@@ -140,32 +148,147 @@ def run_cycle(cfg: config.Config, state: State, bot: TelegramBot | None,
     state.save()
 
 
-def poll_commands(bot: TelegramBot, state: State) -> None:
-    """Короткий (не блокирующий) опрос /start и /stop; прочие апдейты пропускаются."""
+def _notify(bot: TelegramBot, chat_id: int, text: str) -> None:
+    """Best-effort уведомление: сбой отправки не должен откатывать уже случившуюся мутацию данных."""
+    try:
+        bot.send_text(chat_id, text)
+    except Exception:
+        log.exception("Не удалось отправить сообщение в chat_id=%s", chat_id)
+
+
+def _handle_subscribe(bot: TelegramBot, cfg: config.Config, searches_store: GistStore | None,
+                       searches: list[config.Search], pending: list[dict],
+                       chat_id: int, url: str) -> bool:
+    if searches_store is None:
+        _notify(bot, chat_id, "Самостоятельная подписка сейчас недоступна — обратитесь к администратору.")
+        return False
+    if not url:
+        _notify(bot, chat_id, "Пришлите ссылку на карту krisha.kz: /subscribe https://krisha.kz/map/...")
+        return False
+    try:
+        entry = subscriptions.add_pending(searches, pending, chat_id, url)
+    except ValueError as exc:
+        _notify(bot, chat_id, f"Не получилось: {exc}")
+        return False
+    # Мутация уже случилась (entry в pending) — дальше только best-effort уведомления.
+    slot = subscriptions.slot_of(entry["name"])
+    _notify(bot, chat_id, f"Заявка «{entry['name']}» принята, ждите подтверждения администратора.")
+    if cfg.admin_chat_id is not None:
+        _notify(bot, cfg.admin_chat_id,
+                f"Новая заявка от {chat_id}: {entry['url']}\n"
+                f"Одобрить: /approve {chat_id} {slot}\n"
+                f"Отклонить: /reject {chat_id} {slot}")
+    else:
+        _notify(bot, chat_id, "Внимание: у бота не задан ADMIN_CHAT_ID — подтвердить заявку пока некому.")
+    return True
+
+
+def _handle_subs(bot: TelegramBot, searches: list[config.Search], pending: list[dict],
+                  chat_id: int) -> None:
+    items = subscriptions.list_own(searches, pending, chat_id)
+    if not items:
+        _notify(bot, chat_id, "У вас нет подписок. Добавить: /subscribe https://krisha.kz/map/...")
+        return
+    lines = [f"{slot}. {url}" + (" (ожидает одобрения)" if is_pending else "")
+             for slot, url, is_pending in items]
+    _notify(bot, chat_id, "Ваши подписки:\n" + "\n".join(lines) + "\n\nОтписаться: /unsubscribe <номер>")
+
+
+def _handle_unsubscribe(bot: TelegramBot, searches: list[config.Search], pending: list[dict],
+                        chat_id: int, arg: str) -> bool:
+    try:
+        slot = int(arg)
+        url = subscriptions.unsubscribe(searches, pending, chat_id, slot)
+    except ValueError:
+        _notify(bot, chat_id, "Укажите номер подписки: /unsubscribe <номер> (список — /subs)")
+        return False
+    # Мутация уже случилась — уведомление дальше best-effort.
+    _notify(bot, chat_id, f"Подписка №{slot} ({url}) удалена.")
+    return True
+
+
+def _handle_admin_decision(bot: TelegramBot, cfg: config.Config, searches: list[config.Search],
+                           pending: list[dict], chat_id: int, is_approve: bool, arg: str) -> bool:
+    if chat_id != cfg.admin_chat_id:
+        _notify(bot, chat_id, "Эта команда доступна только администратору.")
+        return False
+    try:
+        target_chat_id_s, slot_s = arg.split()
+        target_chat_id, slot = int(target_chat_id_s), int(slot_s)
+        if is_approve:
+            search = subscriptions.approve(searches, pending, target_chat_id, slot)
+        else:
+            entry = subscriptions.reject(pending, target_chat_id, slot)
+    except (ValueError, IndexError) as exc:
+        _notify(bot, chat_id, f"Не получилось: {exc}\nФормат: /approve <chat_id> <номер>")
+        return False
+    # Мутация уже случилась (approve/reject применены) — уведомления дальше best-effort.
+    if is_approve:
+        _notify(bot, chat_id, f"Одобрено: {search.name} для {target_chat_id}.")
+        _notify(bot, target_chat_id, f"Подписка №{slot} подтверждена и активна.")
+    else:
+        _notify(bot, chat_id, f"Отклонено: {entry['name']} для {target_chat_id}.")
+        _notify(bot, target_chat_id, f"Заявка №{slot} отклонена администратором.")
+    return True
+
+
+def poll_commands(bot: TelegramBot, state: State, cfg: config.Config,
+                   searches_store: GistStore | None,
+                   searches: list[config.Search], pending: list[dict]
+                   ) -> tuple[list[config.Search], list[dict]]:
+    """Короткий (не блокирующий) опрос команд; прочие апдейты пропускаются."""
     try:
         bot.api("deleteWebhook")
         updates = bot.get_updates(state.update_offset)
     except Exception:
         log.exception("Не удалось опросить команды — пропускаю до следующего цикла")
-        return
+        return searches, pending
+
+    changed = False
     for update in updates:
         state.update_offset = update["update_id"] + 1
         message = update.get("message") or {}
         chat_id = (message.get("chat") or {}).get("id")
-        text = (message.get("text") or "").strip().lower()
-        if chat_id is None:
+        text = (message.get("text") or "").strip()
+        if chat_id is None or not text:
             continue
+        lower = text.lower()
         try:
-            if text == "/start":
+            if lower == "/start":
                 state.paused.discard(chat_id)
                 bot.send_text(chat_id, f"Готово. Ваш chat_id: {chat_id}\n"
                                         "Если рассылка была на паузе — она возобновлена.")
-            elif text == "/stop":
+            elif lower == "/stop":
                 state.paused.add(chat_id)
                 bot.send_text(chat_id, "Рассылка приостановлена. Пришлите /start, чтобы возобновить.")
+            elif lower.startswith("/subscribe"):
+                changed |= _handle_subscribe(bot, cfg, searches_store, searches, pending,
+                                             chat_id, text[len("/subscribe"):].strip())
+            elif lower == "/subs":
+                _handle_subs(bot, searches, pending, chat_id)
+            elif lower.startswith("/unsubscribe"):
+                changed |= _handle_unsubscribe(bot, searches, pending, chat_id,
+                                               text[len("/unsubscribe"):].strip())
+            elif lower.startswith("/approve") or lower.startswith("/reject"):
+                changed |= _handle_admin_decision(bot, cfg, searches, pending, chat_id,
+                                                  lower.startswith("/approve"),
+                                                  text.partition(" ")[2].strip())
         except Exception:
             log.exception("Не удалось обработать команду от chat_id=%s", chat_id)
     state.save()
+    if changed and searches_store is not None:
+        try:
+            subscriptions.save(searches_store, searches, pending)
+        except Exception:
+            log.exception("Не удалось сохранить список подписок в гист")
+    return searches, pending
+
+
+def _load_searches(cfg: config.Config, searches_store: GistStore | None,
+                    fallback: list[config.Search]) -> tuple[list[config.Search], list[dict]]:
+    """Гист (если настроен и там уже что-то есть) в приоритете, иначе SEARCHES_JSON/файл."""
+    file_env = config.load_searches(cfg.searches_path, fallback=fallback, inline_json=cfg.searches_json)
+    return subscriptions.load(searches_store, fallback=file_env)
 
 
 def main() -> int:
@@ -173,16 +296,19 @@ def main() -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = config.load_config(sys.argv[1:])
     store = None
+    searches_store = None
     if cfg.gist_id and cfg.gist_token:
         store = GistStore(cfg.gist_id, cfg.gist_token, cfg.gist_filename)
-        log.info("Состояние хранится в gist %s (%s)", cfg.gist_id, cfg.gist_filename)
+        searches_store = GistStore(cfg.gist_id, cfg.gist_token, cfg.gist_searches_filename)
+        log.info("Состояние хранится в gist %s (%s), подписки — в %s",
+                  cfg.gist_id, cfg.gist_filename, cfg.gist_searches_filename)
     state = State.load(cfg.state_path, store)
     session = krisha.make_session()
 
-    searches = config.load_searches(cfg.searches_path, fallback=[], inline_json=cfg.searches_json)
+    searches, pending = _load_searches(cfg, searches_store, [])
     if not searches:
-        log.warning("Нет валидных поисков (SEARCHES_JSON / %s) — жду, пока их добавят "
-                    "(команды /start и /stop продолжают работать)", cfg.searches_path)
+        log.warning("Нет валидных поисков (гист/SEARCHES_JSON/%s) — жду, пока их добавят "
+                    "(команды /start, /stop, /subscribe продолжают работать)", cfg.searches_path)
 
     bot: TelegramBot | None = None
     if cfg.bot_token:
@@ -192,10 +318,10 @@ def main() -> int:
         return 1
 
     while True:
-        searches = config.load_searches(cfg.searches_path, fallback=searches, inline_json=cfg.searches_json)
+        searches, pending = _load_searches(cfg, searches_store, searches)
         if bot is not None and not cfg.dry_run:
             try:
-                poll_commands(bot, state)
+                searches, pending = poll_commands(bot, state, cfg, searches_store, searches, pending)
             except Exception:
                 log.exception("Опрос команд завершился с ошибкой")
         try:

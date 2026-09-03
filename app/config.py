@@ -39,6 +39,7 @@ class Config:
     gist_id: str
     gist_token: str
     gist_filename: str
+    gist_searches_filename: str
 
 
 def _env(name: str, default: str) -> str:
@@ -70,6 +71,7 @@ def load_config(argv: list[str] | None = None) -> Config:
         gist_id=os.environ.get("GIST_ID", "").strip(),
         gist_token=os.environ.get("GIST_TOKEN", "").strip(),
         gist_filename=_env("GIST_FILENAME", "krisha-state.json"),
+        gist_searches_filename=_env("GIST_SEARCHES_FILENAME", "krisha-searches.json"),
     )
 
 
